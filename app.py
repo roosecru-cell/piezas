@@ -25,22 +25,44 @@ def extraer_texto(contenido_bytes):
     return "\n".join(texto_completo)
 
 def parsear_piezas(texto):
+    """
+    Retorna: (lista de piezas, porcentaje de descuento)
+    Si no hay descuento, porcentaje = 0.0
+    """
     lineas = texto.splitlines()
 
+    # Encontrar inicio de sección PIEZAS SUSTITUIDAS
     inicio = None
     for i, linea in enumerate(lineas):
         if "PIEZAS SUSTITUIDAS" in linea.upper():
             inicio = i + 1
             break
     if inicio is None:
-        return []
+        return [], 0.0
 
+    # Encontrar fin de sección (Ahorro o SubTotal)
     fin = len(lineas)
     for i in range(inicio, len(lineas)):
-        if re.search(r"ahorro|sub\s*total|total\s*piezas", lineas[i], re.IGNORECASE):
+        if re.search(r"^ahorro\b|^sub\s*total\b", lineas[i], re.IGNORECASE):
             fin = i
             break
 
+    # Buscar porcentaje de descuento en las líneas después del fin
+    descuento_pct = 0.0
+    for linea in lineas[fin:fin+15]:
+        m_pct = re.search(r'\(?\s*%\s*\)?\s*(\d+(?:\.\d+)?)\s*%', linea)
+        if m_pct:
+            descuento_pct = float(m_pct.group(1))
+            break
+        # También buscar formato "40 %" o "(%) 40 %"
+        m_pct2 = re.search(r'(\d+(?:\.\d+)?)\s*%', linea)
+        if m_pct2:
+            val = float(m_pct2.group(1))
+            if 0 < val < 100:  # es un porcentaje razonable
+                descuento_pct = val
+                break
+
+    # Parsear piezas
     piezas = []
     for linea in lineas[inicio:fin]:
         linea = linea.strip()
@@ -63,14 +85,9 @@ def parsear_piezas(texto):
             continue
         piezas.append({"precio": precio_num, "descripcion": descripcion})
 
-    return piezas
+    return piezas, descuento_pct
 
 def generar_excel(resultados):
-    """
-    resultados = lista de dicts: {numero_orden, piezas}
-    Genera un Excel con todas las órdenes, separadas por un bloque de total por orden
-    y un gran total al final.
-    """
     wb = Workbook()
     ws = wb.active
     ws.title = "Piezas Sustituidas"
@@ -79,7 +96,6 @@ def generar_excel(resultados):
     azul_medio = "2E75B6"
     claro      = "D9E1F2"
     fill_hdr   = PatternFill("solid", start_color=azul,       end_color=azul)
-    fill_orden = PatternFill("solid", start_color=azul_medio, end_color=azul_medio)
     fill_alt   = PatternFill("solid", start_color=claro,      end_color=claro)
     fill_blco  = PatternFill("solid", start_color="FFFFFF",   end_color="FFFFFF")
     fill_sub   = PatternFill("solid", start_color="BDD7EE",   end_color="BDD7EE")
@@ -94,9 +110,16 @@ def generar_excel(resultados):
         top=Side(style="medium"), bottom=Side(style="thin")
     )
 
-    # ── Encabezados globales ──────────────────────────────────
-    headers = [("A","No. Orden"), ("B","Precio"), ("C","Descripción")]
-    for col, txt in headers:
+    # Encabezados: No.Orden | Precio Lista | Descuento % | Descuento $ | Precio Final
+    cols = [
+        ("A", "No. Orden"),
+        ("B", "Precio Lista"),
+        ("C", "Descuento %"),
+        ("D", "Descuento $"),
+        ("E", "Precio Final"),
+        ("F", "Descripción"),
+    ]
+    for col, txt in cols:
         c = ws[f"{col}1"]
         c.value     = txt
         c.fill      = fill_hdr
@@ -106,87 +129,115 @@ def generar_excel(resultados):
     ws.row_dimensions[1].height = 20
 
     fila = 2
-    subtotal_ranges = []  # para el gran total al final
+    subtotal_ranges_final = []
 
     for resultado in resultados:
-        numero_orden = resultado["numero_orden"]
-        piezas       = resultado["piezas"]
+        numero_orden  = resultado["numero_orden"]
+        piezas        = resultado["piezas"]
+        descuento_pct = resultado["descuento_pct"]
 
         if not piezas:
             continue
 
-        fila_inicio_orden = fila
+        fila_inicio = fila
 
         for i, p in enumerate(piezas):
             fill = fill_alt if i % 2 == 0 else fill_blco
 
-            co = ws.cell(row=fila, column=1, value=numero_orden)
-            co.fill = fill; co.font = Font(name="Arial", size=10)
-            co.border = borde
-            co.alignment = Alignment(horizontal="center", vertical="center")
+            precio       = p["precio"]
+            desc_monto   = round(precio * descuento_pct / 100, 2)
+            precio_final = round(precio - desc_monto, 2)
 
-            cp = ws.cell(row=fila, column=2, value=p["precio"])
-            cp.number_format = '"$"#,##0.00'
-            cp.fill = fill; cp.font = Font(name="Arial", size=10)
-            cp.border = borde
-            cp.alignment = Alignment(horizontal="right", vertical="center")
+            # A: No. Orden
+            c = ws.cell(row=fila, column=1, value=numero_orden)
+            c.fill = fill; c.font = Font(name="Arial", size=10)
+            c.border = borde; c.alignment = Alignment(horizontal="center", vertical="center")
 
-            cd = ws.cell(row=fila, column=3, value=p["descripcion"])
-            cd.fill = fill; cd.font = Font(name="Arial", size=10)
-            cd.border = borde
-            cd.alignment = Alignment(horizontal="left", vertical="center")
+            # B: Precio Lista
+            c = ws.cell(row=fila, column=2, value=precio)
+            c.number_format = '"$"#,##0.00'
+            c.fill = fill; c.font = Font(name="Arial", size=10)
+            c.border = borde; c.alignment = Alignment(horizontal="right", vertical="center")
+
+            # C: Descuento %
+            c = ws.cell(row=fila, column=3, value=descuento_pct / 100 if descuento_pct else 0)
+            c.number_format = '0%'
+            c.fill = fill; c.font = Font(name="Arial", size=10)
+            c.border = borde; c.alignment = Alignment(horizontal="center", vertical="center")
+
+            # D: Descuento $
+            c = ws.cell(row=fila, column=4, value=desc_monto)
+            c.number_format = '"$"#,##0.00'
+            c.fill = fill; c.font = Font(name="Arial", size=10)
+            c.border = borde; c.alignment = Alignment(horizontal="right", vertical="center")
+
+            # E: Precio Final
+            c = ws.cell(row=fila, column=5, value=precio_final)
+            c.number_format = '"$"#,##0.00'
+            c.fill = fill; c.font = Font(name="Arial", size=10)
+            c.border = borde; c.alignment = Alignment(horizontal="right", vertical="center")
+
+            # F: Descripción
+            c = ws.cell(row=fila, column=6, value=p["descripcion"])
+            c.fill = fill; c.font = Font(name="Arial", size=10)
+            c.border = borde; c.alignment = Alignment(horizontal="left", vertical="center")
 
             fila += 1
 
-        # Subtotal por orden
-        fila_fin_orden = fila - 1
-        subtotal_ranges.append(f"B{fila_inicio_orden}:B{fila_fin_orden}")
+        fila_fin = fila - 1
+        subtotal_ranges_final.append(f"E{fila_inicio}:E{fila_fin}")
 
-        cs_label = ws.cell(row=fila, column=1, value=f"Subtotal Orden {numero_orden}")
-        cs_label.font      = Font(name="Arial", bold=True, size=10, color="FFFFFF")
-        cs_label.fill      = fill_sub
-        cs_label.border    = borde_top
-        cs_label.alignment = Alignment(horizontal="center", vertical="center")
-        cs_label.font      = Font(name="Arial", bold=True, size=10, color=azul)
-        cs_label.fill      = fill_sub
+        # Fila subtotal por orden
+        for col in range(1, 7):
+            c = ws.cell(row=fila, column=col)
+            c.fill = fill_sub; c.border = borde_top
 
-        cs_sum = ws.cell(row=fila, column=2,
-                         value=f"=SUM(B{fila_inicio_orden}:B{fila_fin_orden})")
-        cs_sum.number_format = '"$"#,##0.00'
-        cs_sum.font      = Font(name="Arial", bold=True, size=10, color=azul)
-        cs_sum.fill      = fill_sub
-        cs_sum.border    = borde_top
-        cs_sum.alignment = Alignment(horizontal="right", vertical="center")
+        ws.cell(row=fila, column=1, value=f"Subtotal Orden {numero_orden}").font = Font(name="Arial", bold=True, size=10, color=azul)
+        ws.cell(row=fila, column=1).alignment = Alignment(horizontal="center", vertical="center")
 
-        ws.cell(row=fila, column=3).fill   = fill_sub
-        ws.cell(row=fila, column=3).border = borde_top
+        ws.cell(row=fila, column=2, value=f"=SUM(B{fila_inicio}:B{fila_fin})")
+        ws.cell(row=fila, column=2).number_format = '"$"#,##0.00'
+        ws.cell(row=fila, column=2).font = Font(name="Arial", bold=True, size=10, color=azul)
+        ws.cell(row=fila, column=2).alignment = Alignment(horizontal="right", vertical="center")
+
+        ws.cell(row=fila, column=4, value=f"=SUM(D{fila_inicio}:D{fila_fin})")
+        ws.cell(row=fila, column=4).number_format = '"$"#,##0.00'
+        ws.cell(row=fila, column=4).font = Font(name="Arial", bold=True, size=10, color=azul)
+        ws.cell(row=fila, column=4).alignment = Alignment(horizontal="right", vertical="center")
+
+        ws.cell(row=fila, column=5, value=f"=SUM(E{fila_inicio}:E{fila_fin})")
+        ws.cell(row=fila, column=5).number_format = '"$"#,##0.00'
+        ws.cell(row=fila, column=5).font = Font(name="Arial", bold=True, size=10, color=azul)
+        ws.cell(row=fila, column=5).alignment = Alignment(horizontal="right", vertical="center")
 
         ws.row_dimensions[fila].height = 18
-        fila += 1  # espacio entre órdenes
-        fila += 1
+        fila += 2  # espacio entre órdenes
 
-    # ── Gran Total ───────────────────────────────────────────
-    suma_formula = "+".join([f"SUM({r})" for r in subtotal_ranges])
-    gt_label = ws.cell(row=fila, column=1, value="GRAN TOTAL")
-    gt_label.font      = Font(name="Arial", bold=True, size=12, color="FFFFFF")
-    gt_label.fill      = fill_tot
-    gt_label.border    = borde
-    gt_label.alignment = Alignment(horizontal="center", vertical="center")
+    # Gran Total
+    suma = "+".join([f"SUM({r})" for r in subtotal_ranges_final])
+    for col in range(1, 7):
+        c = ws.cell(row=fila, column=col)
+        c.fill = fill_tot; c.border = borde
 
-    gt_sum = ws.cell(row=fila, column=2, value=f"={suma_formula}")
-    gt_sum.number_format = '"$"#,##0.00'
-    gt_sum.font      = Font(name="Arial", bold=True, size=12, color="FFFFFF")
-    gt_sum.fill      = fill_tot
-    gt_sum.border    = borde
-    gt_sum.alignment = Alignment(horizontal="right", vertical="center")
+    ws.cell(row=fila, column=1, value="GRAN TOTAL").font = Font(name="Arial", bold=True, size=12, color="FFFFFF")
+    ws.cell(row=fila, column=1).fill = fill_tot
+    ws.cell(row=fila, column=1).alignment = Alignment(horizontal="center", vertical="center")
+    ws.cell(row=fila, column=1).border = borde
 
-    ws.cell(row=fila, column=3).fill   = fill_tot
-    ws.cell(row=fila, column=3).border = borde
+    ws.cell(row=fila, column=5, value=f"={suma}")
+    ws.cell(row=fila, column=5).number_format = '"$"#,##0.00'
+    ws.cell(row=fila, column=5).font = Font(name="Arial", bold=True, size=12, color="FFFFFF")
+    ws.cell(row=fila, column=5).fill = fill_tot
+    ws.cell(row=fila, column=5).alignment = Alignment(horizontal="right", vertical="center")
+    ws.cell(row=fila, column=5).border = borde
     ws.row_dimensions[fila].height = 22
 
-    ws.column_dimensions["A"].width = 16
-    ws.column_dimensions["B"].width = 16
-    ws.column_dimensions["C"].width = 40
+    ws.column_dimensions["A"].width = 14
+    ws.column_dimensions["B"].width = 14
+    ws.column_dimensions["C"].width = 13
+    ws.column_dimensions["D"].width = 14
+    ws.column_dimensions["E"].width = 14
+    ws.column_dimensions["F"].width = 38
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -210,10 +261,14 @@ if pdf_files:
             numero_orden = extraer_numero_orden(pdf_file.name)
             contenido    = pdf_file.read()
             texto        = extraer_texto(contenido)
-            piezas       = parsear_piezas(texto)
+            piezas, descuento_pct = parsear_piezas(texto)
 
             if piezas:
-                resultados.append({"numero_orden": numero_orden, "piezas": piezas})
+                resultados.append({
+                    "numero_orden":  numero_orden,
+                    "piezas":        piezas,
+                    "descuento_pct": descuento_pct,
+                })
             else:
                 errores.append(f"⚠️ {pdf_file.name} — no se encontraron piezas")
 
@@ -222,26 +277,31 @@ if pdf_files:
             st.warning(e)
 
     if resultados:
+        total_final = sum(
+            p["precio"] * (1 - r["descuento_pct"] / 100)
+            for r in resultados for p in r["piezas"]
+        )
         total_piezas = sum(len(r["piezas"]) for r in resultados)
-        total_monto  = sum(p["precio"] for r in resultados for p in r["piezas"])
 
-        st.success(f"✅ {len(resultados)} orden(es) procesadas  |  {total_piezas} piezas  |  Total: ${total_monto:,.2f}")
+        st.success(f"✅ {len(resultados)} orden(es)  |  {total_piezas} piezas  |  Total final: ${total_final:,.2f}")
 
-        # Mostrar tabla por orden
         for r in resultados:
-            subtotal = sum(p["precio"] for p in r["piezas"])
-            with st.expander(f"📋 Orden {r['numero_orden']} — {len(r['piezas'])} piezas  |  ${subtotal:,.2f}"):
+            subtotal_final = sum(p["precio"] * (1 - r["descuento_pct"] / 100) for p in r["piezas"])
+            desc_label = f"  |  Descuento: {r['descuento_pct']:.0f}%" if r["descuento_pct"] > 0 else "  |  Sin descuento"
+            with st.expander(f"📋 Orden {r['numero_orden']} — {len(r['piezas'])} piezas{desc_label}  |  ${subtotal_final:,.2f}"):
                 st.dataframe(
                     {
-                        "No. Orden":   [r["numero_orden"]] * len(r["piezas"]),
-                        "Precio":      [f"${p['precio']:,.2f}" for p in r["piezas"]],
-                        "Descripción": [p["descripcion"] for p in r["piezas"]],
+                        "No. Orden":    [r["numero_orden"]] * len(r["piezas"]),
+                        "Precio Lista": [f"${p['precio']:,.2f}" for p in r["piezas"]],
+                        "Descuento %":  [f"{r['descuento_pct']:.0f}%" for _ in r["piezas"]],
+                        "Descuento $":  [f"${p['precio'] * r['descuento_pct'] / 100:,.2f}" for p in r["piezas"]],
+                        "Precio Final": [f"${p['precio'] * (1 - r['descuento_pct']/100):,.2f}" for p in r["piezas"]],
+                        "Descripción":  [p["descripcion"] for p in r["piezas"]],
                     },
                     use_container_width=True,
                     hide_index=True
                 )
 
-        # Descargar Excel con todo
         excel_buf    = generar_excel(resultados)
         ordenes      = "_".join(r["numero_orden"] for r in resultados)
         nombre_excel = f"piezas_{ordenes}.xlsx" if len(resultados) <= 5 else f"piezas_{len(resultados)}_ordenes.xlsx"
