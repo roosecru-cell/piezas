@@ -6,18 +6,10 @@ from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
-# ── Configuración de la página ───────────────────────────────
-st.set_page_config(
-    page_title="Extractor de Piezas GNP",
-    page_icon="🔧",
-    layout="centered"
-)
-
+st.set_page_config(page_title="Extractor de Piezas GNP", page_icon="🔧", layout="centered")
 st.title("🔧 Extractor de Piezas Sustituidas")
 st.markdown("**Valuaciones GNP / Audatex** — Sube tu PDF y descarga el Excel al instante.")
 st.divider()
-
-# ── Funciones ────────────────────────────────────────────────
 
 def extraer_texto(contenido_bytes):
     texto_completo = []
@@ -28,49 +20,63 @@ def extraer_texto(contenido_bytes):
                 texto_completo.append(texto)
     return "\n".join(texto_completo)
 
-
 def parsear_piezas(texto):
     lineas = texto.splitlines()
 
+    # Encontrar inicio de sección
     inicio = None
     for i, linea in enumerate(lineas):
         if "PIEZAS SUSTITUIDAS" in linea.upper():
             inicio = i + 1
             break
-
     if inicio is None:
         return []
 
+    # Encontrar fin de sección
     fin = len(lineas)
     for i in range(inicio, len(lineas)):
-        if re.search(r"^ahorro\b|^sub\s*total\b", lineas[i], re.IGNORECASE):
+        if re.search(r"ahorro|sub\s*total|total\s*piezas", lineas[i], re.IGNORECASE):
             fin = i
             break
 
     bloque = lineas[inicio:fin]
-
-    patron = re.compile(
-        r"^(\$[\d,]+\.\d{2})[A-Za-z]?\s+"
-        r"\S+\s+"
-        r"(.+?)\s+"
-        r"[A-Z0-9]{8,}\s+"
-        r"\d+\s*$"
-    )
-
     piezas = []
+
     for linea in bloque:
         linea = linea.strip()
         if not linea:
             continue
-        m = patron.match(linea)
-        if m:
-            precio = m.group(1)
-            desc   = m.group(2).strip()
-            if desc and not re.match(r"^(precio|referencia|descripci)", desc, re.IGNORECASE):
-                piezas.append({"precio": precio, "descripcion": desc})
+
+        # Extraer precio: empieza con $ seguido de dígitos/comas/punto
+        # seguido opcionalmente de letra o asterisco (indicador de fuente)
+        m_precio = re.match(r'^([\$][\d,]+\.\d{2})[\*A-Za-z]?\s+', linea)
+        if not m_precio:
+            continue
+
+        precio = m_precio.group(1)
+        resto  = linea[m_precio.end():]
+
+        # El resto tiene: REFERENCIA  DESCRIPCION...  NUMPIEZA  POSBD
+        # Separar por espacios
+        tokens = resto.split()
+        # Necesitamos al menos: ref + 1 desc + numpieza + posbd = 4 tokens
+        if len(tokens) < 4:
+            continue
+
+        # ref = tokens[0], posbd = tokens[-1], numpieza = tokens[-2]
+        # descripcion = todo lo que hay entre ref y numpieza
+        descripcion = ' '.join(tokens[1:-2]).strip()
+
+        if not descripcion:
+            continue
+
+        # Filtrar encabezados
+        if re.match(r'^(precio|referencia|descripci)', descripcion, re.IGNORECASE):
+            continue
+
+        piezas.append({"precio": precio, "descripcion": descripcion})
 
     return piezas
-
 
 def generar_excel(piezas, nombre):
     wb = Workbook()
@@ -79,11 +85,10 @@ def generar_excel(piezas, nombre):
 
     azul  = "1F4E79"
     claro = "D9E1F2"
-
-    fill_hdr  = PatternFill("solid", start_color=azul,      end_color=azul)
-    fill_alt  = PatternFill("solid", start_color=claro,     end_color=claro)
-    fill_blco = PatternFill("solid", start_color="FFFFFF",  end_color="FFFFFF")
-    fill_tot  = PatternFill("solid", start_color=azul,      end_color=azul)
+    fill_hdr  = PatternFill("solid", start_color=azul,     end_color=azul)
+    fill_alt  = PatternFill("solid", start_color=claro,    end_color=claro)
+    fill_blco = PatternFill("solid", start_color="FFFFFF", end_color="FFFFFF")
+    fill_tot  = PatternFill("solid", start_color=azul,     end_color=azul)
     borde = Border(
         left=Side(style="thin"), right=Side(style="thin"),
         top=Side(style="thin"),  bottom=Side(style="thin")
@@ -95,7 +100,7 @@ def generar_excel(piezas, nombre):
     ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 26
 
-    for col, txt in [("A", "Precio"), ("B", "Descripción")]:
+    for col, txt in [("A","Precio"), ("B","Descripción")]:
         c = ws[f"{col}2"]
         c.value     = txt
         c.fill      = fill_hdr
@@ -122,7 +127,6 @@ def generar_excel(piezas, nombre):
     ws[f"A{ft}"].fill      = fill_tot
     ws[f"A{ft}"].alignment = Alignment(horizontal="right", vertical="center")
     ws[f"A{ft}"].border    = borde
-
     ws.column_dimensions["A"].width = 14
     ws.column_dimensions["B"].width = 40
 
@@ -131,9 +135,7 @@ def generar_excel(piezas, nombre):
     buf.seek(0)
     return buf
 
-
 # ── Interfaz ─────────────────────────────────────────────────
-
 pdf_file = st.file_uploader(
     "📄 Sube tu valuación en PDF",
     type=["pdf"],
@@ -147,11 +149,9 @@ if pdf_file is not None:
         piezas    = parsear_piezas(texto)
 
     if not piezas:
-        st.error("❌ No se encontró la sección 'PIEZAS SUSTITUIDAS' en este PDF. Verifica que sea una valuación GNP/Audatex.")
+        st.error("❌ No se encontró la sección 'PIEZAS SUSTITUIDAS'. Verifica que sea una valuación GNP/Audatex.")
     else:
         st.success(f"✅ {len(piezas)} piezas encontradas")
-
-        # Mostrar tabla
         st.subheader("Piezas sustituidas")
         st.dataframe(
             {"Precio": [p["precio"] for p in piezas],
@@ -159,12 +159,9 @@ if pdf_file is not None:
             use_container_width=True,
             hide_index=True
         )
-
-        # Botón de descarga
         nombre_base  = Path(pdf_file.name).stem
         excel_buf    = generar_excel(piezas, nombre_base)
         nombre_excel = nombre_base + "_piezas.xlsx"
-
         st.download_button(
             label="📥 Descargar Excel",
             data=excel_buf,
@@ -175,3 +172,4 @@ if pdf_file is not None:
 
 st.divider()
 st.caption("Vanguardia Body & Paint — Extractor de valuaciones GNP")
+
