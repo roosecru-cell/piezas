@@ -7,7 +7,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 st.set_page_config(page_title="Extractor de Piezas GNP", page_icon="🔧", layout="centered")
-st.title("🔧 Extractor de Piezas Sustituidas")
+st.title("🔧 Extractor de Refacciones Audatex")
 st.markdown("**Valuaciones / Audatex** — Sube uno o varios PDFs y descarga todo en un solo Excel.")
 st.divider()
 
