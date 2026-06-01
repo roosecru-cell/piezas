@@ -261,4 +261,4 @@ if pdf_files:
             use_container_width=True)
 
 st.divider()
-st.caption("Extractor de valuaciones")
+st.caption("Extractor de Refacciones")
