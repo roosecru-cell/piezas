@@ -1,266 +1,339 @@
 import streamlit as st
 import pdfplumber
+import pandas as pd
 import re
 import io
-from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
-st.set_page_config(page_title="Extractor Refacciones-Audatex", page_icon="🔧", layout="centered")
-st.title("🔧 Extractor de Refacciones Audatex")
-st.markdown("**Valuaciones / Audatex** — Sube uno o varios PDFs y descarga todo en un solo Excel.")
-st.divider()
+st.set_page_config(page_title="Extractor Órdenes GNP", page_icon="🚗", layout="wide")
 
-def extraer_numero_orden(nombre_archivo):
-    m = re.match(r'^(\w+)', Path(nombre_archivo).stem)
-    return m.group(1) if m else Path(nombre_archivo).stem
+st.markdown("""
+<style>
+    .stButton>button { background-color: #C8102E; color: white; border-radius: 8px; font-weight: bold; }
+    .result-box { background-color: #e8f5e9; border-left: 4px solid #2e7d32; padding: 12px; border-radius: 4px; margin: 10px 0; }
+</style>
+""", unsafe_allow_html=True)
 
-def extraer_texto(contenido_bytes):
-    texto_completo = []
-    with pdfplumber.open(io.BytesIO(contenido_bytes)) as pdf:
-        for pagina in pdf.pages:
-            texto = pagina.extract_text()
-            if texto:
-                texto_completo.append(texto)
-    return "\n".join(texto_completo)
+st.title("🚗 Extractor de Órdenes de Admisión GNP")
+st.caption("Sube uno o varios PDFs de órdenes GNP y descarga un Excel con los datos clave.")
 
-def es_token_descripcion(token):
-    """Determina si un token pertenece a la descripción o al número de pieza."""
-    if len(token) == 1: return False           # letra sola (R, T) = numpieza
-    if token == '..': return False             # especificación llanta
-    if re.search(r'\d', token): return False   # contiene número = numpieza
-    if token.endswith('.'): return True        # termina en punto = descripción
-    if '.' in token and re.match(r'^[A-Za-záéíóúÁÉÍÓÚñÑ\.]+$', token): return True  # I.DIRECCION
-    if re.match(r'^[A-Za-záéíóúÁÉÍÓÚñÑ\-]+$', token): return True  # palabra pura
-    return False
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 
-def extraer_descripcion_linea(linea):
-    """Extrae precio y descripción de una línea de pieza."""
-    m = re.match(r'^([\$][\d,]+\.\d{2})[\*A-Za-z]?\s+', linea)
-    if not m: return None, None
-    precio = m.group(1)
-    tokens = linea[m.end():].split()
-    if len(tokens) < 3: return precio, None
+def clean(t):
+    return " ".join(t.strip().split()) if t else ""
 
-    # tokens[0]=referencia, tokens[-1]=Pos.BD (solo dígitos)
-    middle = tokens[1:-1]
+def next_line_after(lines, header_keywords):
+    """Devuelve la línea inmediata después de la que contiene alguno de los keywords."""
+    for i, line in enumerate(lines):
+        if any(kw.lower() in line.lower() for kw in header_keywords):
+            if i + 1 < len(lines):
+                return clean(lines[i + 1])
+    return None
 
-    # Buscar el último token que pertenece a la descripción
-    desc_end = 0
-    for i, t in enumerate(middle):
-        if es_token_descripcion(t):
-            desc_end = i + 1
+def value_in_same_line(lines, keyword):
+    """Busca keyword y devuelve lo que sigue en la misma línea después de él."""
+    for line in lines:
+        if keyword.lower() in line.lower():
+            after = re.split(re.escape(keyword), line, flags=re.IGNORECASE, maxsplit=1)
+            if len(after) > 1 and after[1].strip():
+                return clean(after[1])
+    return None
 
-    desc = ' '.join(middle[:desc_end]).strip()
-    return precio, desc if desc else None
+def extract_field_after_header(lines, header_keywords, stop_keywords=None):
+    """Para campos que están en la línea siguiente al header de columnas."""
+    stop_keywords = stop_keywords or []
+    for i, line in enumerate(lines):
+        if any(kw.lower() in line.lower() for kw in header_keywords):
+            # Buscar siguiente línea no vacía
+            for j in range(i + 1, min(i + 4, len(lines))):
+                candidate = clean(lines[j])
+                if not candidate:
+                    continue
+                # Si la siguiente línea es otro header, no es dato
+                if any(sk.lower() in candidate.lower() for sk in stop_keywords):
+                    break
+                return candidate
+    return None
 
-def parsear_piezas(texto):
-    lineas = texto.splitlines()
-
-    inicio = None
-    for i, linea in enumerate(lineas):
-        if "PIEZAS SUSTITUIDAS" in linea.upper():
-            inicio = i + 1
-            break
-    if inicio is None:
-        return [], 0.0
-
-    fin = len(lineas)
-    for i in range(inicio, len(lineas)):
-        if re.search(r"^ahorro\b|^sub\s*total\b", lineas[i], re.IGNORECASE):
-            fin = i
-            break
-
-    # Buscar porcentaje de descuento después del bloque
-    descuento_pct = 0.0
-    for linea in lineas[fin:fin+15]:
-        m_pct = re.search(r'(\d+(?:\.\d+)?)\s*%', linea)
-        if m_pct:
-            val = float(m_pct.group(1))
-            if 0 < val < 100:
-                descuento_pct = val
+def extract_block_after_label(lines, label_keywords, stop_keywords):
+    """Extrae un bloque de texto (puede ser multilinea) después de un label."""
+    collecting = False
+    result = []
+    for line in lines:
+        stripped = clean(line)
+        if not collecting:
+            if any(kw.lower() in stripped.lower() for kw in label_keywords):
+                collecting = True
+                continue
+        else:
+            if any(sk.lower() in stripped.lower() for sk in stop_keywords):
                 break
+            if stripped:
+                result.append(stripped)
+    return " ".join(result) if result else None
 
-    piezas = []
-    for linea in lineas[inicio:fin]:
-        linea = linea.strip()
-        if not linea:
-            continue
-        precio, desc = extraer_descripcion_linea(linea)
-        if not precio or not desc:
-            continue
-        if re.match(r'^(precio|referencia|descripci)', desc, re.IGNORECASE):
-            continue
-        try:
-            precio_num = float(precio.replace('$', '').replace(',', ''))
-        except:
-            precio_num = 0.0
-        piezas.append({"precio": precio_num, "descripcion": desc})
+def extract_cdr(lines):
+    """Extrae el CDR de la sección Observaciones."""
+    obs_lines = []
+    in_obs = False
+    for line in lines:
+        stripped = clean(line)
+        if not in_obs:
+            if stripped.lower() == "observaciones":
+                in_obs = True
+                continue
+        else:
+            if any(k in stripped.lower() for k in ["piezas faltantes", "nombre y firma"]):
+                break
+            if stripped:
+                obs_lines.append(stripped)
+    obs_text = " ".join(obs_lines)
+    m = re.search(r"CDR\s*:\s*(.+?)(?:Direcci[oó]n|$)", obs_text, re.IGNORECASE)
+    if m:
+        return clean(m.group(1))
+    # Si no hay CDR: en Observaciones, buscar en todo el texto
+    full = " ".join(lines)
+    m2 = re.search(r"CDR\s*:\s*(.+?)(?:Direcci[oó]n|Siniestro|$)", full, re.IGNORECASE)
+    return clean(m2.group(1)) if m2 else "N/A"
 
-    return piezas, descuento_pct
+# ─── Extractor principal ──────────────────────────────────────────────────────
 
-def generar_excel(resultados):
+def extract_data(pdf_file):
+    with pdfplumber.open(pdf_file) as pdf:
+        full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+    lines = full_text.splitlines()
+    data = {}
+
+    # Detectar formato B (Información general / Autoajuste)
+    formato_b = any("Información general" in l for l in lines)
+
+    # ── No. de siniestro ──────────────────────────────────────────────────
+    hdr = ["No. de siniestro Fecha de siniestro", "Número de siniestro Fecha de atención",
+           "No. de siniestro", "Número de siniestro"]
+    val = extract_field_after_header(lines, hdr,
+          stop_keywords=["Estado", "Número de póliza", "Datos de la póliza"])
+    if val:
+        # El valor puede ser "0183607944 21/05/2026 ..." — tomar primer token
+        data["No. Siniestro"] = val.split()[0]
+    else:
+        data["No. Siniestro"] = "N/A"
+
+    # ── Fecha de atención ─────────────────────────────────────────────────
+    # Está en la misma fila de datos que el siniestro (Formato A: columna 4)
+    # Buscar línea con patrón fecha/hora de atención
+    fecha_aten = "N/A"
+    for line in lines:
+        # Línea con 4-5 fechas dd/mm/aaaa: siniestro | fecha sin | hora sin | fecha aten | fecha entrega
+        dates = re.findall(r'\d{2}/\d{2}/\d{4}', line)
+        times = re.findall(r'\d{2}:\d{2}(?:\s*[AP]M)?', line)
+        if len(dates) >= 3:
+            # Formato A: [fecha_sin, fecha_aten, fecha_entrega] con horas intercaladas
+            # Reconstruimos posiciones: buscar "fecha aten" = 3ra fecha
+            fecha_aten = dates[2] if len(dates) >= 3 else dates[-1]
+            break
+        elif len(dates) == 2 and formato_b:
+            # Formato B: "0183313899 15/05/2026 09:00 15/05/2026 10:11"
+            fecha_aten = dates[0]
+            break
+    data["Fecha de Atención"] = fecha_aten
+
+    # ── Versión ───────────────────────────────────────────────────────────
+    val = extract_field_after_header(lines, ["Versión Placas", "Tipo de vehículo Versión"],
+          stop_keywords=["Vehículo responsable", "Modelo Número"])
+    if not val:
+        for i, line in enumerate(lines):
+            if re.match(r"Tipo de veh[ií]culo\s+Versi[oó]n", line, re.IGNORECASE):
+                if i + 1 < len(lines):
+                    v = clean(lines[i+1])
+                    # quitar el prefijo de tipo (AUT, AUTOMOVIL, etc.)
+                    v = re.sub(r"^(AUT|AUTOMÓVIL|AUTOMOVIL)\s+", "", v, flags=re.IGNORECASE)
+                    val = v
+                    break
+    if val:
+        # Formato A la línea es "VOLKSWAGEN CROSSGOLF L4 1.4... UPG752J 3VWVB6..."
+        # La versión termina antes de las placas — tomar hasta un patrón de placa
+        m = re.match(r"(.+?)\s+[A-Z]{2,3}\d{3,4}[A-Z]?\b", val)
+        data["Versión"] = clean(m.group(1)) if m else val
+    else:
+        data["Versión"] = "N/A"
+
+    # ── Modelo (año) ──────────────────────────────────────────────────────
+    val = extract_field_after_header(lines,
+          ["Clasificación Tipo de vehículo Armadora"],
+          stop_keywords=["Versión", "Vehículo responsable"])
+    if val:
+        # línea: "AUTOMÓVIL VOLKSWAGEN VOLKSWAGEN CROSSGOLF 2017"
+        m = re.search(r"\b(19|20)\d{2}\b", val)
+        data["Modelo"] = m.group(0) if m else val.split()[-1]
+    else:
+        # Formato B: "Modelo Número de serie" → siguiente línea "2014 WBA3..."
+        val2 = extract_field_after_header(lines, ["Modelo Número de serie"],
+               stop_keywords=["Daños", "Declaración"])
+        if val2:
+            data["Modelo"] = val2.split()[0]
+        else:
+            data["Modelo"] = "N/A"
+
+    # ── Placas ────────────────────────────────────────────────────────────
+    # Aparece en la línea de datos de versión: buscar patrón de placa mexicana
+    placas = "N/A"
+    for line in lines:
+        m = re.search(r'\b([A-Z]{2,3}\d{3,4}[A-Z]?)\b', line)
+        if m and "Placas" not in line and "Número" not in line:
+            placas = m.group(1)
+            break
+    data["Placas"] = placas
+
+    # ── Nombre conductor / asegurado ──────────────────────────────────────
+    val = extract_field_after_header(lines,
+          ["Nombre del conductor Fecha de nacimiento"],
+          stop_keywords=["Identificación", "Licencia"])
+    if not val:
+        val = extract_field_after_header(lines,
+              ["Nombre del Asegurado Referencia", "Nombre del asegurado Cobertura"],
+              stop_keywords=["Datos del vehículo", "Teléfono"])
+    if val:
+        # En formato A la línea es "LARISSA CORELLY... 20/09/1998 27 5651164865"
+        # Tomar solo la parte del nombre (sin fecha/edad/tel)
+        m = re.match(r"([A-ZÁÉÍÓÚÜÑa-záéíóúüñ ]{5,}?)(?:\s+\d{2}/\d{2}/\d{4}|\s+\d{10})", val)
+        data["Nombre / Conductor"] = clean(m.group(1)) if m else val
+    else:
+        data["Nombre / Conductor"] = "N/A"
+
+    # ── Teléfono ──────────────────────────────────────────────────────────
+    tel = "N/A"
+    for line in lines:
+        # Buscar línea con nombre+tel: "NOMBRE 20/09/1998 27 5651164865, 7821759935"
+        m = re.search(r'\b(\d{10}(?:,\s*\d{10})?)\s*$', line)
+        if m:
+            tel = m.group(1)
+            break
+    data["Teléfono"] = tel
+
+    # ── Correo electrónico ────────────────────────────────────────────────
+    correo = "N/A"
+    email_pattern = re.compile(r'[\w.+-]+@[\w.-]+\.\w+')
+    for line in lines:
+        emails = email_pattern.findall(line)
+        if emails:
+            correo = ", ".join(emails)
+            break
+    data["Correo Electrónico"] = correo
+
+    # ── Daños a consecuencia ──────────────────────────────────────────────
+    val = extract_block_after_label(lines,
+          ["Daños a consecuencia del siniestro", "Daños a consecuencia"],
+          stop_keywords=["Observaciones", "Piezas faltantes", "Nombre y firma", "Declaración"])
+    data["Daños a Consecuencia"] = val if val else "N/A"
+
+    # ── CDR (de Observaciones) ────────────────────────────────────────────
+    data["CDR"] = extract_cdr(lines)
+
+    return data
+
+
+# ─── Excel builder ────────────────────────────────────────────────────────────
+
+COLUMNS = [
+    "No. Siniestro", "Versión", "Modelo", "Placas",
+    "Nombre / Conductor", "Teléfono", "Correo Electrónico",
+    "Fecha de Atención", "Daños a Consecuencia", "CDR"
+]
+
+def build_excel(rows):
     wb = Workbook()
     ws = wb.active
-    ws.title = "Piezas Sustituidas"
+    ws.title = "Órdenes GNP"
 
-    azul  = "1F4E79"
-    claro = "D9E1F2"
-    fill_hdr  = PatternFill("solid", start_color=azul,     end_color=azul)
-    fill_alt  = PatternFill("solid", start_color=claro,    end_color=claro)
-    fill_blco = PatternFill("solid", start_color="FFFFFF", end_color="FFFFFF")
-    fill_sub  = PatternFill("solid", start_color="BDD7EE", end_color="BDD7EE")
-    fill_tot  = PatternFill("solid", start_color=azul,     end_color=azul)
-    borde = Border(left=Side(style="thin"), right=Side(style="thin"),
-                   top=Side(style="thin"),  bottom=Side(style="thin"))
-    borde_top = Border(left=Side(style="thin"), right=Side(style="thin"),
-                       top=Side(style="medium"), bottom=Side(style="thin"))
+    thin = Side(style="thin", color="BDBDBD")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    cols = [("A","No. Orden"),("B","Descripción"),("C","Precio Lista"),
-            ("D","Descuento %"),("E","Descuento $"),("F","Precio Final")]
-    for col, txt in cols:
-        c = ws[f"{col}1"]
-        c.value = txt; c.fill = fill_hdr
-        c.font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
-        c.alignment = Alignment(horizontal="center", vertical="center")
-        c.border = borde
-    ws.row_dimensions[1].height = 20
+    for col_idx, col_name in enumerate(COLUMNS, 1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+        cell.fill = PatternFill("solid", start_color="C8102E")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = border
+    ws.row_dimensions[1].height = 30
 
-    fila = 2
-    subtotal_ranges = []
+    for row_idx, row in enumerate(rows, 2):
+        fill_color = "FCE4EC" if row_idx % 2 == 0 else "FFFFFF"
+        fill = PatternFill("solid", start_color=fill_color)
+        for col_idx, col_name in enumerate(COLUMNS, 1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=row.get(col_name, "N/A"))
+            cell.font = Font(name="Arial", size=9)
+            cell.fill = fill
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+            cell.border = border
+        ws.row_dimensions[row_idx].height = 50
 
-    for resultado in resultados:
-        numero_orden  = resultado["numero_orden"]
-        piezas        = resultado["piezas"]
-        descuento_pct = resultado["descuento_pct"]
-        if not piezas: continue
+    widths = [16, 40, 8, 12, 30, 24, 32, 14, 55, 45]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
 
-        fila_inicio = fila
-        for i, p in enumerate(piezas):
-            fill         = fill_alt if i % 2 == 0 else fill_blco
-            precio       = p["precio"]
-            desc_monto   = round(precio * descuento_pct / 100, 2)
-            precio_final = round(precio - desc_monto, 2)
-
-            def cell(col, val, fmt=None, align="left"):
-                c = ws.cell(row=fila, column=col, value=val)
-                c.fill = fill; c.font = Font(name="Arial", size=10)
-                c.border = borde
-                c.alignment = Alignment(horizontal=align, vertical="center")
-                if fmt: c.number_format = fmt
-                return c
-
-            cell(1, numero_orden, align="center")
-            cell(2, p["descripcion"])
-            cell(3, precio, '"$"#,##0.00', "right")
-            cell(4, descuento_pct/100 if descuento_pct else 0, '0%', "center")
-            cell(5, desc_monto, '"$"#,##0.00', "right")
-            cell(6, precio_final, '"$"#,##0.00', "right")
-            fila += 1
-
-        fila_fin = fila - 1
-        subtotal_ranges.append(f"F{fila_inicio}:F{fila_fin}")
-
-        # Subtotal por orden
-        for col in range(1, 7):
-            c = ws.cell(row=fila, column=col)
-            c.fill = fill_sub; c.border = borde_top
-
-        def sub(col, val=None, fmt=None):
-            c = ws.cell(row=fila, column=col, value=val)
-            c.fill = fill_sub
-            c.font = Font(name="Arial", bold=True, size=10, color=azul)
-            c.border = borde_top
-            c.alignment = Alignment(horizontal="right" if fmt else "center", vertical="center")
-            if fmt: c.number_format = fmt
-            return c
-
-        sub(1, f"Subtotal Orden {numero_orden}")
-        sub(3, f"=SUM(C{fila_inicio}:C{fila_fin})", '"$"#,##0.00')
-        sub(5, f"=SUM(E{fila_inicio}:E{fila_fin})", '"$"#,##0.00')
-        sub(6, f"=SUM(F{fila_inicio}:F{fila_fin})", '"$"#,##0.00')
-        ws.row_dimensions[fila].height = 18
-        fila += 2
-
-    # Gran Total
-    suma = "+".join([f"SUM({r})" for r in subtotal_ranges])
-    for col in range(1, 7):
-        c = ws.cell(row=fila, column=col)
-        c.fill = fill_tot; c.border = borde
-
-    ws.cell(row=fila, column=1, value="GRAN TOTAL")
-    ws.cell(row=fila, column=1).font = Font(name="Arial", bold=True, size=12, color="FFFFFF")
-    ws.cell(row=fila, column=1).fill = fill_tot
-    ws.cell(row=fila, column=1).alignment = Alignment(horizontal="center", vertical="center")
-    ws.cell(row=fila, column=1).border = borde
-
-    gt = ws.cell(row=fila, column=6, value=f"={suma}")
-    gt.number_format = '"$"#,##0.00'
-    gt.font = Font(name="Arial", bold=True, size=12, color="FFFFFF")
-    gt.fill = fill_tot
-    gt.alignment = Alignment(horizontal="right", vertical="center")
-    gt.border = borde
-    ws.row_dimensions[fila].height = 22
-
-    ws.column_dimensions["A"].width = 12
-    ws.column_dimensions["B"].width = 38
-    ws.column_dimensions["C"].width = 14
-    ws.column_dimensions["D"].width = 12
-    ws.column_dimensions["E"].width = 14
-    ws.column_dimensions["F"].width = 14
+    ws.freeze_panes = "A2"
 
     buf = io.BytesIO()
-    wb.save(buf); buf.seek(0)
-    return buf
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
 
-# ── Interfaz ─────────────────────────────────────────────────
-pdf_files = st.file_uploader(
-    "📄 Sube tus valuaciones en PDF", type=["pdf"],
-    accept_multiple_files=True, help="Puedes seleccionar varios PDFs a la vez"
+
+# ─── UI ──────────────────────────────────────────────────────────────────────
+
+uploaded_files = st.file_uploader(
+    "📂 Sube los PDFs de Órdenes de Admisión GNP",
+    type=["pdf"],
+    accept_multiple_files=True
 )
 
-if pdf_files:
-    resultados = []; errores = []
-    with st.spinner(f"Procesando {len(pdf_files)} archivo(s)..."):
-        for pdf_file in sorted(pdf_files, key=lambda f: f.name):
-            numero_orden = extraer_numero_orden(pdf_file.name)
-            contenido    = pdf_file.read()
-            texto        = extraer_texto(contenido)
-            piezas, descuento_pct = parsear_piezas(texto)
-            if piezas:
-                resultados.append({"numero_orden": numero_orden, "piezas": piezas, "descuento_pct": descuento_pct})
-            else:
-                errores.append(f"⚠️ {pdf_file.name} — no se encontraron piezas")
+if uploaded_files:
+    if st.button("⚡ Extraer datos"):
+        all_rows = []
+        errores = []
+        progress = st.progress(0)
 
-    for e in errores: st.warning(e)
+        for i, f in enumerate(uploaded_files):
+            try:
+                row = extract_data(f)
+                all_rows.append(row)
+            except Exception as e:
+                errores.append(f"❌ `{f.name}` — {e}")
+            progress.progress((i + 1) / len(uploaded_files))
 
-    if resultados:
-        total_final  = sum(p["precio"]*(1-r["descuento_pct"]/100) for r in resultados for p in r["piezas"])
-        total_piezas = sum(len(r["piezas"]) for r in resultados)
-        st.success(f"✅ {len(resultados)} orden(es)  |  {total_piezas} piezas  |  Total final: ${total_final:,.2f}")
+        for msg in errores:
+            st.warning(msg)
 
-        for r in resultados:
-            subtotal   = sum(p["precio"]*(1-r["descuento_pct"]/100) for p in r["piezas"])
-            desc_label = f"  |  Descuento: {r['descuento_pct']:.0f}%" if r["descuento_pct"] > 0 else "  |  Sin descuento"
-            with st.expander(f"📋 Orden {r['numero_orden']} — {len(r['piezas'])} piezas{desc_label}  |  ${subtotal:,.2f}"):
-                st.dataframe({
-                    "No. Orden":    [r["numero_orden"]] * len(r["piezas"]),
-                    "Descripción":  [p["descripcion"] for p in r["piezas"]],
-                    "Precio Lista": [f"${p['precio']:,.2f}" for p in r["piezas"]],
-                    "Descuento %":  [f"{r['descuento_pct']:.0f}%" for _ in r["piezas"]],
-                    "Descuento $":  [f"${p['precio']*r['descuento_pct']/100:,.2f}" for p in r["piezas"]],
-                    "Precio Final": [f"${p['precio']*(1-r['descuento_pct']/100):,.2f}" for p in r["piezas"]],
-                }, use_container_width=True, hide_index=True)
+        if all_rows:
+            excel_bytes = build_excel(all_rows)
 
-        excel_buf    = generar_excel(resultados)
-        ordenes      = "_".join(r["numero_orden"] for r in resultados)
-        nombre_excel = f"piezas_{ordenes}.xlsx" if len(resultados) <= 5 else f"piezas_{len(resultados)}_ordenes.xlsx"
-        st.download_button(label="📥 Descargar Excel con todas las órdenes",
-            data=excel_buf, file_name=nombre_excel,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True)
+            st.markdown('<div class="result-box">', unsafe_allow_html=True)
+            st.markdown(f"✅ **{len(all_rows)} orden(es)** procesada(s) de **{len(uploaded_files)} PDF(s)**")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            df_show = pd.DataFrame(all_rows)[COLUMNS]
+            st.dataframe(df_show, use_container_width=True, hide_index=True)
+
+            out_name = (
+                f"orden_{all_rows[0]['No. Siniestro']}.xlsx"
+                if len(all_rows) == 1
+                else "ordenes_admision_gnp.xlsx"
+            )
+
+            st.download_button(
+                label="📥  Descargar Excel",
+                data=excel_bytes,
+                file_name=out_name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+        else:
+            st.error("No se pudo extraer información de ningún PDF.")
 else:
-    st.info("👆 Sube los PDFs de valuación para comenzar.")
+    st.info("👆 Sube uno o más PDFs de Órdenes de Admisión GNP para comenzar.")
 
-st.divider()
-st.caption("Extractor de Refacciones Audatex")
+st.markdown("---")
+st.caption("New Roads · Extractor Órdenes de Admisión GNP")
