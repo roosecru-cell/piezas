@@ -248,10 +248,15 @@ def extraer_mo_pintura(pdf_bytes: bytes) -> dict:
                                  "categoria":clasificar_mo(desc)}); continue
             m=RE_ITEM.match(s)
             if m and m.group(1).upper() not in SKIP:
-                desc=m.group(2).strip()
-                mo_items.append({"nr":m.group(1),"descripcion":desc,
+                nr   = m.group(1)
+                desc = m.group(2).strip()
+                if nr == "1000":
+                    cat = "Hojalatería/Refacción"
+                else:
+                    cat = clasificar_mo(desc)
+                mo_items.append({"nr":nr,"descripcion":desc,
                                  "precio":parse_price(m.group(3)),
-                                 "categoria":clasificar_mo(desc)})
+                                 "categoria":cat})
 
     return {"mo":mo_items, "pintura":pin_items, "meta":meta}
 
@@ -419,6 +424,21 @@ def build_excel(all_orders: list) -> bytes:
             put(row,3,item["nr"],  fill,align=CTR)
             put(row,4,item["descripcion"],fill)
             put(row,5,item["precio"],fill,fmt=MONEY,align=RGT)
+            for c in (6,7,8): put(row,c,"",fill)
+            row+=1
+
+        # ── 2b. HOJALATERÍA/REFACCIÓN (NR=1000) ─────────────────────────────
+        F_REF_HOJ1 = PatternFill("solid", fgColor="FFF2CC")   # amarillo claro even
+        F_REF_HOJ2 = PatternFill("solid", fgColor="FFFDE7")   # amarillo muy claro odd
+        hoj_ref = [x for x in mo if x.get("categoria")=="Hojalatería/Refacción"]
+        for i, item in enumerate(hoj_ref):
+            ws.row_dimensions[row].height=16
+            fill = F_REF_HOJ1 if i%2==0 else F_REF_HOJ2
+            put(row,1,n_ord,                    fill,align=CTR)
+            put(row,2,"Hojalatería/Refacción",  fill)
+            put(row,3,item["nr"],               fill,align=CTR)
+            put(row,4,item["descripcion"],      fill)
+            put(row,5,item["precio"],           fill,fmt=MONEY,align=RGT)
             for c in (6,7,8): put(row,c,"",fill)
             row+=1
 
@@ -606,8 +626,10 @@ for order in all_orders:
                 } for x in order["mo"]])
                 st.dataframe(df_mo, use_container_width=True, hide_index=True)
                 t = meta.get("total_mo", sum(x["precio"] for x in order["mo"]))
-                n_mec = sum(1 for x in order["mo"] if x.get("categoria")=="Mecánica")
-                st.caption(f"🔧 Mecánica: {n_mec}  ·  🛠️ Hojalatería: {len(order['mo'])-n_mec}")
+                n_mec     = sum(1 for x in order["mo"] if x.get("categoria")=="Mecánica")
+                n_hoj_ref = sum(1 for x in order["mo"] if x.get("categoria")=="Hojalatería/Refacción")
+                n_hoj     = len(order["mo"]) - n_mec - n_hoj_ref
+                st.caption(f"🔧 Mecánica: {n_mec}  ·  🛠️ Hojalatería: {n_hoj}  ·  🔩 Hojal/Refacción: {n_hoj_ref}")
                 st.success(f"**Total M.O.: ${t:,.2f}**")
 
         # Pintura
